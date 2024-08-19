@@ -1,0 +1,179 @@
+# Creating an AI which summarizes YT transcripts
+# You can obtain a Youtube API Key here: https://console.cloud.google.com/apis/library/youtube.googleapis.com?project=quiet-sanctuary-432520-r4 
+
+# Install Google API client library, Python-docx for Word documents, Transformers for NLP models, and other dependencies
+%pip install google-api-python-client python-docx transformers
+%pip install faiss-cpu
+%pip install sentence-transformers
+%pip install langchain
+%pip install -U langchain-community
+%pip install youtube-transcript-api
+
+import os
+from googleapiclient.discovery import build
+from docx import Document
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+import faiss
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+
+# Function to obtain YT video descriptions and transcripts with a high number of likes
+def get_youtube_videos(api_key, search_query, max_results=10, min_likes=0):
+    youtube = build('youtube', 'v3', developerKey=api_key)
+    videos = []
+    next_page_token = None
+
+    while len(videos) < max_results:
+        try:
+            request = youtube.search().list(
+                q=search_query,
+                part='snippet',
+                maxResults=min(max_results - len(videos), 50),  # Limit request to max needed results
+                type='video',
+                pageToken=next_page_token
+            )
+            response = request.execute()
+
+            for item in response.get('items', []):
+                video_id = item['id']['videoId']
+
+                # Retrieve video statistics to check like count
+                video_request = youtube.videos().list(
+                    part='statistics',
+                    id=video_id
+                )
+                video_response = video_request.execute()
+
+                if video_response['items']:
+                    like_count = int(video_response['items'][0]['statistics'].get('likeCount', 0))
+
+                    if like_count >= min_likes:
+                        title = item['snippet']['title']
+                        description = item['snippet']['description']
+                        video_url = f"https://www.youtube.com/watch?v={video_id}"
+
+                        # Attempt to retrieve the video transcript
+                        try:
+                            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+                            transcript_text = ' '.join([t['text'] for t in transcript])
+                        except (TranscriptsDisabled, NoTranscriptFound):
+                            transcript_text = None
+
+                        videos.append({
+                            'title': title,
+                            'description': description,
+                            'url': video_url,
+                            'likes': like_count,
+                            'transcript': transcript_text
+                        })
+
+            next_page_token = response.get('nextPageToken')
+
+            if not next_page_token:
+                break
+
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            break
+
+    return videos
+
+# Function to summarize text using a pre-trained summarization model
+def summarize_text(text):
+    summarizer = pipeline('summarization', model="facebook/bart-large-cnn")
+    summary = summarizer(text, max_length=130, min_length=30, do_sample=False)
+    return summary[0]['summary_text']
+
+# Function to create a Word document with video summaries
+def create_word_document(videos, summaries, filename='summaries.docx'):
+    doc = Document()
+    doc.add_heading('YouTube Video Summaries', 0)
+
+    for video, summary in zip(videos, summaries):
+        transcript = video['transcript']
+        description = video['description']
+        text_to_summarize = transcript if transcript else description
+
+        doc.add_heading(video['title'], level=1)
+        doc.add_paragraph(f"Video URL: {video['url']}")
+        doc.add_paragraph(f"Likes: {video['likes']}")
+        doc.add_paragraph(f"Description: {description}")
+        doc.add_paragraph(f"Summary: {summary}")
+        doc.add_paragraph()
+
+    doc.save(filename)
+
+# Function to create a vector store using LangChain and FAISS
+def create_vector_store(summaries):
+    embeddings = HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2')
+    vector_store = FAISS.from_texts(summaries, embeddings)
+    return vector_store
+
+# Function to search in the vector store for similar summaries
+def search_vector_store(vector_store, query):
+    results = vector_store.similarity_search(query)
+    return results
+
+# Function to initialize LLM (Large Language Model) for text generation
+def initialize_llm():
+    tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
+    model = AutoModelForCausalLM.from_pretrained("distilgpt2")
+    return tokenizer, model
+
+# Function to generate text based on a prompt using the LLM
+def generate_text(prompt, tokenizer, model):
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt")
+        if inputs.input_ids.max() >= model.config.vocab_size:
+            raise ValueError("Input contains token(s) not in the model's vocabulary.")
+        outputs = model.generate(inputs.input_ids, max_length=150, num_return_sequences=1)
+        return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    except IndexError as e:
+        print(f"IndexError: {e}")
+        return "Error: Index out of range encountered during text generation."
+    except ValueError as e:
+        print(f"ValueError: {e}")
+        return "Error: Invalid input text for the model."
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return "Error: An unexpected error occurred during text generation."
+
+# Main function to orchestrate the workflow
+def main():
+    api_key = os.getenv('YOUTUBE_API_KEY', 'PUT_API_KEY_HERE')
+
+    while True:
+        search_query = input("Enter the search query: ")
+        max_results = int(input("Enter the maximum number of results: "))
+        min_likes = int(input("Enter the minimum number of likes a video must have: "))
+
+        videos = get_youtube_videos(api_key, search_query, max_results, min_likes)
+
+        if len(videos) >= max_results:
+            break
+        else:
+            print(f"Found {len(videos)} videos, which is less than the requested {max_results} results.")
+            print("Please adjust your search criteria or increase the number of results.")
+
+    descriptions = [video['description'] for video in videos]
+    summaries = [summarize_text(video['transcript'] if video['transcript'] else video['description']) for video in videos]
+
+    create_word_document(videos, summaries)
+
+    vector_store = create_vector_store(summaries)
+
+    results = search_vector_store(vector_store, search_query)
+
+    tokenizer, model = initialize_llm()
+
+    for result in results:
+        result_text = result.get('text', '') if isinstance(result, dict) else str(result)
+
+        print(f"Result: {result_text}")
+        generated_text = generate_text(result_text, tokenizer, model)
+        print(f"Generated text based on result: {result_text}")
+        print(generated_text)
+
+if __name__ == "__main__":
+    main()
