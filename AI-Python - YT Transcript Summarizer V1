@@ -1,4 +1,5 @@
 # Creating an AI which summarizes YT transcripts
+# Worked on the code as a team with a group of 3, in which each of us help developed a part of the program. In this case, I as the author, for the most part formulated the basic idea of the project via getting a YT API Key, organizing the project, and testing the program as much as possible.
 # You can obtain a Youtube API Key here: https://console.cloud.google.com/apis/library/youtube.googleapis.com?project=quiet-sanctuary-432520-r4 
 
 # Install Google API client library, Python-docx for Word documents, Transformers for NLP models, and other dependencies
